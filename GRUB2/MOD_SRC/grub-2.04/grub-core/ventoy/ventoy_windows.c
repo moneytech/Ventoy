@@ -40,12 +40,232 @@
 
 GRUB_MOD_LICENSE ("GPLv3+");
 
-wim_hash g_old_hash;
-wim_tail g_wim_data;
+static int g_iso_fs_type = 0;
+static int g_wim_total_patch_count = 0;
+static int g_wim_valid_patch_count = 0;
+static wim_patch *g_wim_patch_head = NULL;
 
-static wim_lookup_entry *g_replace_look = NULL;
+static grub_uint64_t g_suppress_wincd_override_offset = 0;
+static grub_uint32_t g_suppress_wincd_override_data = 0;
+
+grub_uint8_t g_temp_buf[512];
 
 grub_ssize_t lzx_decompress ( const void *data, grub_size_t len, void *buf );
+grub_ssize_t xca_decompress ( const void *data, grub_size_t len, void *buf );
+
+static wim_patch *ventoy_find_wim_patch(const char *path)
+{
+    int len = (int)grub_strlen(path);
+    wim_patch *node = g_wim_patch_head;
+
+    while (node)
+    {
+        if (len == node->pathlen && 0 == grub_strcmp(path, node->path))
+        {
+            return node;
+        }
+        node = node->next;
+    }
+
+    return NULL;
+}
+
+static int ventoy_collect_wim_patch(const char *bcdfile)
+{
+    int i, j, k;
+    int rc = 1;
+    grub_uint64_t magic;
+    grub_file_t file = NULL;
+    char *buf = NULL;
+    wim_patch *node = NULL;
+    char c;
+    grub_uint8_t byte;
+    char valid;
+    char path[256];
+
+    g_ventoy_case_insensitive = 1;
+    file = grub_file_open(bcdfile, VENTOY_FILE_TYPE);
+    g_ventoy_case_insensitive = 0;
+    if (!file)
+    {
+        debug("Failed to open file %s\n", bcdfile);
+        grub_errno = 0;
+        goto end;
+    }
+
+    buf = grub_malloc(file->size + 8);
+    if (!buf)
+    {
+        goto end;
+    }
+
+    grub_file_read(file, buf, file->size);
+
+    for (i = 0; i < (int)file->size - 8; i++)
+    {        
+        if (buf[i + 8] != 0)
+        {
+            continue;
+        }
+        
+        magic = *(grub_uint64_t *)(buf + i);
+        
+        /* .wim .WIM .Wim */
+        if ((magic == 0x006D00690077002EULL) ||
+            (magic == 0x004D00490057002EULL) ||
+            (magic == 0x006D00690057002EULL))
+        {
+            for (j = i; j > 0; j-= 2)
+            {
+                if (*(grub_uint16_t *)(buf + j) == 0)
+                {
+                    break;
+                }
+            }
+
+            if (j > 0)
+            {
+                byte = (grub_uint8_t)(*(grub_uint16_t *)(buf + j + 2));
+                if (byte != '/' && byte != '\\')
+                {
+                    continue;
+                }
+                
+                valid = 1;
+                for (k = 0, j += 2; k < (int)sizeof(path) - 1 && j < i + 8; j += 2)
+                {
+                    byte = (grub_uint8_t)(*(grub_uint16_t *)(buf + j));
+                    c = (char)byte;
+                    if (byte > '~' || byte < ' ') /* not printable */
+                    {
+                        valid = 0;
+                        break;
+                    }
+                    else if (c == '\\')
+                    {
+                        c = '/';
+                    }
+                    
+                    path[k++] = c;
+                }
+                path[k++] = 0;
+
+                debug("@@@@ Find wim flag:<%s>\n", path);
+
+                if (0 == valid)
+                {
+                    debug("Invalid wim file %d\n", k);
+                }
+                else if (NULL == ventoy_find_wim_patch(path))
+                {
+                    node = grub_zalloc(sizeof(wim_patch));
+                    if (node)
+                    {
+                        node->pathlen = grub_snprintf(node->path, sizeof(node->path), "%s", path);
+
+                        debug("add patch <%s>\n", path);
+                        
+                        if (g_wim_patch_head)
+                        {
+                            node->next = g_wim_patch_head;
+                        }
+                        g_wim_patch_head = node;
+
+                        g_wim_total_patch_count++;
+                    }
+                }
+                else
+                {
+                    debug("wim <%s> already exist\n", path);
+                }
+            }
+        }
+    }
+
+end:
+    check_free(file, grub_file_close);
+    grub_check_free(buf);
+    return rc;
+}
+
+grub_err_t ventoy_cmd_wim_patch_count(grub_extcmd_context_t ctxt, int argc, char **args)
+{
+    char buf[32];
+    
+    (void)ctxt;
+    (void)argc;
+    (void)args;
+
+    if (argc == 1)
+    {
+        grub_snprintf(buf, sizeof(buf), "%d", g_wim_total_patch_count);
+        ventoy_set_env(args[0], buf);
+    }
+    
+    return 0;
+}
+
+grub_err_t ventoy_cmd_collect_wim_patch(grub_extcmd_context_t ctxt, int argc, char **args)
+{
+    wim_patch *node = NULL;
+    
+    (void)ctxt;
+    (void)argc;
+    (void)args;
+
+    if (argc != 2)
+    {
+        return 1;
+    }
+
+    debug("ventoy_cmd_collect_wim_patch %s %s\n", args[0], args[1]);
+
+    if (grub_strcmp(args[0], "bcd") == 0)
+    {
+        ventoy_collect_wim_patch(args[1]);
+        return 0;
+    }
+
+    if (NULL == ventoy_find_wim_patch(args[1]))
+    {
+        node = grub_zalloc(sizeof(wim_patch));
+        if (node)
+        {
+            node->pathlen = grub_snprintf(node->path, sizeof(node->path), "%s", args[1]);
+
+            debug("add patch <%s>\n", args[1]);
+            
+            if (g_wim_patch_head)
+            {
+                node->next = g_wim_patch_head;
+            }
+            g_wim_patch_head = node;
+
+            g_wim_total_patch_count++;
+        }
+    }
+
+    return 0;
+}
+
+
+grub_err_t ventoy_cmd_dump_wim_patch(grub_extcmd_context_t ctxt, int argc, char **args)
+{
+    int i = 0;
+    wim_patch *node = NULL;
+
+    (void)ctxt;
+    (void)argc;
+    (void)args;
+
+    for (node = g_wim_patch_head; node; node = node->next)
+    {
+        grub_printf("%d %s [%s]\n", i++, node->path, node->valid ? "SUCCESS" : "FAIL");
+    }
+
+    return 0;
+}
+
 
 static int wim_name_cmp(const char *search, grub_uint16_t *name, grub_uint16_t namelen)
 {
@@ -96,15 +316,23 @@ static int ventoy_is_pe64(grub_uint8_t *buffer)
 
 grub_err_t ventoy_cmd_wimdows_reset(grub_extcmd_context_t ctxt, int argc, char **args)
 {
+    wim_patch *next = NULL;
+    wim_patch *node = g_wim_patch_head;
+
     (void)ctxt;
     (void)argc;
     (void)args;
-    
-    check_free(g_wim_data.jump_bin_data, grub_free);
-    check_free(g_wim_data.new_meta_data, grub_free);
-    check_free(g_wim_data.new_lookup_data, grub_free);
 
-    grub_memset(&g_wim_data, 0, sizeof(g_wim_data));
+    while (node)
+    {
+        next = node->next;
+        grub_free(node);
+        node = next;
+    }
+
+    g_wim_patch_head = NULL;
+    g_wim_total_patch_count = 0;
+    g_wim_valid_patch_count = 0;
 
     return 0;
 }
@@ -159,7 +387,7 @@ end:
     return 0;
 }
 
-static int ventoy_get_override_info(grub_file_t file)
+static int ventoy_get_override_info(grub_file_t file, wim_tail *wim_data)
 {
     grub_uint32_t start_block;
     grub_uint64_t file_offset;
@@ -169,7 +397,7 @@ static int ventoy_get_override_info(grub_file_t file)
     
     if (grub_strcmp(file->fs->name, "iso9660") == 0)
     {
-        g_wim_data.iso_type = 0;
+        g_iso_fs_type = wim_data->iso_type = 0;
         override_len = sizeof(ventoy_iso9660_override);
         override_offset = grub_iso9660_get_last_file_dirent_pos(file) + 2;
 
@@ -181,7 +409,7 @@ static int ventoy_get_override_info(grub_file_t file)
     }
     else
     {
-        g_wim_data.iso_type = 1;    
+        g_iso_fs_type = wim_data->iso_type = 1;    
         override_len = sizeof(ventoy_udf_override);
         override_offset = grub_udf_get_last_file_attr_offset(file, &start_block, &fe_entry_size_offset);
         
@@ -191,16 +419,16 @@ static int ventoy_get_override_info(grub_file_t file)
             (ulonglong)file->size, (ulonglong)override_offset, (ulonglong)file_offset, start_block);
     }
 
-    g_wim_data.file_offset = file_offset;
-    g_wim_data.udf_start_block = start_block;
-    g_wim_data.fe_entry_size_offset = fe_entry_size_offset;
-    g_wim_data.override_offset = override_offset;
-    g_wim_data.override_len = override_len;
+    wim_data->file_offset = file_offset;
+    wim_data->udf_start_block = start_block;
+    wim_data->fe_entry_size_offset = fe_entry_size_offset;
+    wim_data->override_offset = override_offset;
+    wim_data->override_len = override_len;
 
     return 0;
 }
 
-static int ventoy_read_resource(grub_file_t fp, wim_resource_header *head, void **buffer)
+static int ventoy_read_resource(grub_file_t fp, wim_header *wimhdr, wim_resource_header *head, void **buffer)
 {
     int decompress_len = 0;
     int total_decompress = 0;
@@ -250,7 +478,14 @@ static int ventoy_read_resource(grub_file_t fp, wim_resource_header *head, void 
         }
         else
         {
-            decompress_len = (int)lzx_decompress(buffer_compress + cur_offset, chunk_size, cur_dst);
+            if (wimhdr->flags & FLAG_HEADER_COMPRESS_XPRESS)
+            {
+                decompress_len = (int)xca_decompress(buffer_compress + cur_offset, chunk_size, cur_dst);
+            }
+            else
+            {
+                decompress_len = (int)lzx_decompress(buffer_compress + cur_offset, chunk_size, cur_dst);                
+            }
         }
 
         //debug("chunk_size:%u decompresslen:%d\n", chunk_size, decompress_len);
@@ -272,7 +507,14 @@ static int ventoy_read_resource(grub_file_t fp, wim_resource_header *head, void 
     }
     else
     {
-        decompress_len = (int)lzx_decompress(buffer_compress + cur_offset, head->size_in_wim - cur_offset, cur_dst);            
+        if (wimhdr->flags & FLAG_HEADER_COMPRESS_XPRESS)
+        {
+            decompress_len = (int)xca_decompress(buffer_compress + cur_offset, head->size_in_wim - cur_offset, cur_dst);
+        }
+        else
+        {
+            decompress_len = (int)lzx_decompress(buffer_compress + cur_offset, head->size_in_wim - cur_offset, cur_dst);
+        }
     }
     
     cur_dst += decompress_len;
@@ -322,13 +564,9 @@ static wim_directory_entry * search_full_wim_dirent
     {
         subdir = (wim_directory_entry *)((char *)meta_data + search->subdir);
         search = search_wim_dirent(subdir, *path);
-        if (!search)
-        {
-            debug("%s search failed\n", *path);
-        }
-
         path++;
     }
+    
     return search;
 }
 
@@ -336,19 +574,23 @@ static wim_directory_entry * search_replace_wim_dirent(void *meta_data, wim_dire
 {
     wim_directory_entry *wim_dirent = NULL;
     const char *winpeshl_path[] = { "Windows", "System32", "winpeshl.exe", NULL };
-    const char *pecmd_path[] = { "Windows", "System32", "PECMD.exe", NULL };
+    //const char *native_path[] = { "Windows", "System32", "native.exe", NULL };
 
     wim_dirent = search_full_wim_dirent(meta_data, dir, winpeshl_path);
+    debug("search winpeshl.exe %p\n", wim_dirent);
     if (wim_dirent)
     {
         return wim_dirent;
     }
-    
-    wim_dirent = search_full_wim_dirent(meta_data, dir, pecmd_path);
+
+    #if 0
+    wim_dirent = search_full_wim_dirent(meta_data, dir, native_path);
+    debug("search native.exe %p\n", wim_dirent);
     if (wim_dirent)
     {
         return wim_dirent;
     }
+    #endif
 
     return NULL;
 }
@@ -394,7 +636,7 @@ static wim_lookup_entry * ventoy_find_meta_entry(wim_header *header, wim_lookup_
     return NULL;
 }
 
-static int ventoy_update_all_hash(void *meta_data, wim_directory_entry *dir)
+static int ventoy_update_all_hash(wim_patch *patch, void *meta_data, wim_directory_entry *dir)
 {
     if ((meta_data == NULL) || (dir == NULL))
     {
@@ -408,15 +650,15 @@ static int ventoy_update_all_hash(void *meta_data, wim_directory_entry *dir)
 
     do
     {
-        if (dir->subdir == 0 && grub_memcmp(dir->hash.sha1, g_old_hash.sha1, sizeof(wim_hash)) == 0)
+        if (dir->subdir == 0 && grub_memcmp(dir->hash.sha1, patch->old_hash.sha1, sizeof(wim_hash)) == 0)
         {
             debug("find target file, name_len:%u upadte hash\n", dir->name_len);
-            grub_memcpy(dir->hash.sha1, &(g_wim_data.bin_hash), sizeof(wim_hash));
+            grub_memcpy(dir->hash.sha1, &(patch->wim_data.bin_hash), sizeof(wim_hash));
         }
         
         if (dir->subdir)
         {
-            ventoy_update_all_hash(meta_data, (wim_directory_entry *)((char *)meta_data + dir->subdir));
+            ventoy_update_all_hash(patch, meta_data, (wim_directory_entry *)((char *)meta_data + dir->subdir));
         }
     
         dir = (wim_directory_entry *)((char *)dir + dir->len);
@@ -425,7 +667,7 @@ static int ventoy_update_all_hash(void *meta_data, wim_directory_entry *dir)
     return 0;
 }
 
-static int ventoy_cat_exe_file_data(grub_uint32_t exe_len, grub_uint8_t *exe_data)
+static int ventoy_cat_exe_file_data(wim_tail *wim_data, grub_uint32_t exe_len, grub_uint8_t *exe_data)
 {
     int pe64 = 0;
     char file[256];
@@ -439,19 +681,19 @@ static int ventoy_cat_exe_file_data(grub_uint32_t exe_len, grub_uint8_t *exe_dat
     ventoy_load_jump_exe(file, &jump_data, &jump_len, NULL);
     jump_align = ventoy_align(jump_len, 16);
     
-    g_wim_data.jump_exe_len = jump_len;
-    g_wim_data.bin_raw_len = jump_align + sizeof(ventoy_os_param) + sizeof(ventoy_windows_data) + exe_len;
-    g_wim_data.bin_align_len = ventoy_align(g_wim_data.bin_raw_len, 2048);
+    wim_data->jump_exe_len = jump_len;
+    wim_data->bin_raw_len = jump_align + sizeof(ventoy_os_param) + sizeof(ventoy_windows_data) + exe_len;
+    wim_data->bin_align_len = ventoy_align(wim_data->bin_raw_len, 2048);
     
-    g_wim_data.jump_bin_data = grub_malloc(g_wim_data.bin_align_len);
-    if (g_wim_data.jump_bin_data)
+    wim_data->jump_bin_data = grub_malloc(wim_data->bin_align_len);
+    if (wim_data->jump_bin_data)
     {
-        grub_memcpy(g_wim_data.jump_bin_data, jump_data, jump_len);
-        grub_memcpy(g_wim_data.jump_bin_data + jump_align + sizeof(ventoy_os_param) + sizeof(ventoy_windows_data), exe_data, exe_len);
+        grub_memcpy(wim_data->jump_bin_data, jump_data, jump_len);
+        grub_memcpy(wim_data->jump_bin_data + jump_align + sizeof(ventoy_os_param) + sizeof(ventoy_windows_data), exe_data, exe_len);
     }
 
     debug("jump_exe_len:%u bin_raw_len:%u bin_align_len:%u\n", 
-        g_wim_data.jump_exe_len, g_wim_data.bin_raw_len, g_wim_data.bin_align_len);
+        wim_data->jump_exe_len, wim_data->bin_raw_len, wim_data->bin_align_len);
     
     return 0;
 }
@@ -470,7 +712,7 @@ int ventoy_fill_windows_rtdata(void *buf, char *isopath)
         return 1;
     }
 
-    script = ventoy_plugin_get_install_template(pos);
+    script = ventoy_plugin_get_cur_install_template(pos);
     if (script)
     {
         debug("auto install script <%s>\n", script);
@@ -478,7 +720,25 @@ int ventoy_fill_windows_rtdata(void *buf, char *isopath)
     }
     else
     {
-        debug("auto install script not found %p\n", pos);
+        debug("auto install script skipped or not configed %s\n", pos);
+    }
+
+    script = (char *)ventoy_plugin_get_injection(pos);
+    if (script)
+    {
+        if (ventoy_check_file_exist("%s%s", ventoy_get_env("vtoy_iso_part"), script))
+        {
+            debug("injection archive <%s> OK\n", script);
+            grub_snprintf(data->injection_archive, sizeof(data->injection_archive) - 1, "%s", script);
+        }
+        else
+        {
+            debug("injection archive <%s> NOT exist\n", script);
+        }
+    }
+    else
+    {
+        debug("injection archive not configed %s\n", pos);
     }
     
     return 0;
@@ -490,49 +750,63 @@ static int ventoy_update_before_chain(ventoy_os_param *param, char *isopath)
     wim_lookup_entry *meta_look = NULL;
     wim_security_header *security = NULL;
     wim_directory_entry *rootdir = NULL;
-    wim_header *head = &(g_wim_data.wim_header);    
-    wim_lookup_entry *lookup = (wim_lookup_entry *)g_wim_data.new_lookup_data;
+    wim_header *head = NULL;
+    wim_lookup_entry *lookup = NULL;
+    wim_patch *node = NULL;
+    wim_tail *wim_data = NULL;
 
-    jump_align = ventoy_align(g_wim_data.jump_exe_len, 16);
-    if (g_wim_data.jump_bin_data)
+    for (node = g_wim_patch_head; node; node = node->next)
     {
-        grub_memcpy(g_wim_data.jump_bin_data + jump_align, param, sizeof(ventoy_os_param));        
-        ventoy_fill_windows_rtdata(g_wim_data.jump_bin_data + jump_align + sizeof(ventoy_os_param), isopath);
-    }
+        if (0 == node->valid)
+        {
+            continue;
+        }
 
-    grub_crypto_hash(GRUB_MD_SHA1, g_wim_data.bin_hash.sha1, g_wim_data.jump_bin_data, g_wim_data.bin_raw_len);
+        wim_data = &node->wim_data;
+        head = &wim_data->wim_header;
+        lookup = (wim_lookup_entry *)wim_data->new_lookup_data;
 
-    security = (wim_security_header *)g_wim_data.new_meta_data;
-    rootdir = (wim_directory_entry *)(g_wim_data.new_meta_data + ((security->len + 7) & 0xFFFFFFF8U));
+        jump_align = ventoy_align(wim_data->jump_exe_len, 16);
+        if (wim_data->jump_bin_data)
+        {
+            grub_memcpy(wim_data->jump_bin_data + jump_align, param, sizeof(ventoy_os_param));        
+            ventoy_fill_windows_rtdata(wim_data->jump_bin_data + jump_align + sizeof(ventoy_os_param), isopath);
+        }
 
-    /* update all winpeshl.exe dirent entry's hash */
-    ventoy_update_all_hash(g_wim_data.new_meta_data, rootdir);
+        grub_crypto_hash(GRUB_MD_SHA1, wim_data->bin_hash.sha1, wim_data->jump_bin_data, wim_data->bin_raw_len);
 
-    /* update winpeshl.exe lookup entry data (hash/offset/length) */
-    if (g_replace_look)
-    {
-        debug("update replace lookup entry_id:%ld\n", ((long)g_replace_look - (long)lookup) / sizeof(wim_lookup_entry));
-        g_replace_look->resource.raw_size = g_wim_data.bin_raw_len;
-        g_replace_look->resource.size_in_wim = g_wim_data.bin_raw_len;
-        g_replace_look->resource.flags = 0;
-        g_replace_look->resource.offset = g_wim_data.wim_align_size;
+        security = (wim_security_header *)wim_data->new_meta_data;
+        rootdir = (wim_directory_entry *)(wim_data->new_meta_data + ((security->len + 7) & 0xFFFFFFF8U));
 
-        grub_memcpy(g_replace_look->hash.sha1, g_wim_data.bin_hash.sha1, sizeof(wim_hash));
-    }
+        /* update all winpeshl.exe dirent entry's hash */
+        ventoy_update_all_hash(node, wim_data->new_meta_data, rootdir);
 
-    /* update metadata's hash */
-    meta_look = ventoy_find_meta_entry(head, lookup);
-    if (meta_look)
-    {
-        debug("find meta lookup entry_id:%ld\n", ((long)meta_look - (long)lookup) / sizeof(wim_lookup_entry));
-        grub_memcpy(&meta_look->resource, &head->metadata, sizeof(wim_resource_header));
-        grub_crypto_hash(GRUB_MD_SHA1, meta_look->hash.sha1, g_wim_data.new_meta_data, g_wim_data.new_meta_len);
+        /* update winpeshl.exe lookup entry data (hash/offset/length) */
+        if (node->replace_look)
+        {
+            debug("update replace lookup entry_id:%ld\n", ((long)node->replace_look - (long)lookup) / sizeof(wim_lookup_entry));
+            node->replace_look->resource.raw_size = wim_data->bin_raw_len;
+            node->replace_look->resource.size_in_wim = wim_data->bin_raw_len;
+            node->replace_look->resource.flags = 0;
+            node->replace_look->resource.offset = wim_data->wim_align_size;
+
+            grub_memcpy(node->replace_look->hash.sha1, wim_data->bin_hash.sha1, sizeof(wim_hash));
+        }
+
+        /* update metadata's hash */
+        meta_look = ventoy_find_meta_entry(head, lookup);
+        if (meta_look)
+        {
+            debug("find meta lookup entry_id:%ld\n", ((long)meta_look - (long)lookup) / sizeof(wim_lookup_entry));
+            grub_memcpy(&meta_look->resource, &head->metadata, sizeof(wim_resource_header));
+            grub_crypto_hash(GRUB_MD_SHA1, meta_look->hash.sha1, wim_data->new_meta_data, wim_data->new_meta_len);
+        }
     }
 
     return 0;
 }
 
-grub_err_t ventoy_cmd_wimdows_locate_wim(grub_extcmd_context_t ctxt, int argc, char **args)
+static int ventoy_wimdows_locate_wim(const char *disk, wim_patch *patch)
 {
     int rc;
     grub_file_t file;
@@ -543,20 +817,22 @@ grub_err_t ventoy_cmd_wimdows_locate_wim(grub_extcmd_context_t ctxt, int argc, c
     wim_security_header *security = NULL;
     wim_directory_entry *rootdir = NULL;
     wim_directory_entry *search = NULL;
-    wim_header *head = &(g_wim_data.wim_header);    
+    wim_header *head = &(patch->wim_data.wim_header);    
+    wim_tail *wim_data = &patch->wim_data;
     
-    (void)ctxt;
-    (void)argc;
+    debug("windows locate wim start %s\n", patch->path);
 
-    debug("windows locate wim start %s\n", args[0]);
+    g_ventoy_case_insensitive = 1;
+    file = ventoy_grub_file_open(VENTOY_FILE_TYPE, "%s%s", disk, patch->path);
+    g_ventoy_case_insensitive = 0;
     
-    file = ventoy_grub_file_open(VENTOY_FILE_TYPE, "%s", args[0]);
     if (!file)
     {
-        return grub_error(GRUB_ERR_BAD_ARGUMENT, "Can't open file %s\n", args[0]); 
+        debug("File %s%s NOT exist\n", disk, patch->path);
+        return 1;
     }
 
-    ventoy_get_override_info(file);
+    ventoy_get_override_info(file, &patch->wim_data);
 
     grub_file_seek(file, 0);
     grub_file_read(file, head, sizeof(wim_header));
@@ -568,14 +844,14 @@ grub_err_t ventoy_cmd_wimdows_locate_wim(grub_extcmd_context_t ctxt, int argc, c
         return 1;
     }
 
-    if (head->flags & FLAG_HEADER_COMPRESS_XPRESS)
+    if (head->flags & FLAG_HEADER_COMPRESS_LZMS)
     {
-        debug("Xpress compress is not supported 0x%x\n", head->flags);
+        debug("LZMS compress is not supported 0x%x\n", head->flags);
         grub_file_close(file);
         return 1;
     }
 
-    rc = ventoy_read_resource(file, &head->metadata, (void **)&decompress_data);
+    rc = ventoy_read_resource(file, head, &head->metadata, (void **)&decompress_data);
     if (rc)
     {
         grub_printf("failed to read meta data %d\n", rc);
@@ -596,8 +872,8 @@ grub_err_t ventoy_cmd_wimdows_locate_wim(grub_extcmd_context_t ctxt, int argc, c
     }
     
     debug("find replace file at %p\n", search);
-
-    grub_memcpy(&g_old_hash, search->hash.sha1, sizeof(wim_hash));
+    
+    grub_memcpy(&patch->old_hash, search->hash.sha1, sizeof(wim_hash));
 
     debug("read lookup offset:%llu size:%llu\n", (ulonglong)head->lookup.offset, (ulonglong)head->lookup.raw_size);
     lookup = grub_malloc(head->lookup.raw_size);
@@ -605,16 +881,16 @@ grub_err_t ventoy_cmd_wimdows_locate_wim(grub_extcmd_context_t ctxt, int argc, c
     grub_file_read(file, lookup, head->lookup.raw_size);
 
     /* find and extact winpeshl.exe */
-    g_replace_look = ventoy_find_look_entry(head, lookup, &g_old_hash);
-    if (g_replace_look)
+    patch->replace_look = ventoy_find_look_entry(head, lookup, &patch->old_hash);
+    if (patch->replace_look)
     {
-        exe_len = (grub_uint32_t)g_replace_look->resource.raw_size;
+        exe_len = (grub_uint32_t)patch->replace_look->resource.raw_size;
         debug("find replace lookup entry_id:%ld raw_size:%u\n", 
-            ((long)g_replace_look - (long)lookup) / sizeof(wim_lookup_entry), exe_len);
+            ((long)patch->replace_look - (long)lookup) / sizeof(wim_lookup_entry), exe_len);
 
-        if (0 == ventoy_read_resource(file, &(g_replace_look->resource), (void **)&(exe_data)))
+        if (0 == ventoy_read_resource(file, head, &(patch->replace_look->resource), (void **)&(exe_data)))
         {
-            ventoy_cat_exe_file_data(exe_len, exe_data);
+            ventoy_cat_exe_file_data(wim_data, exe_len, exe_data);
             grub_free(exe_data);
         }
         else
@@ -624,104 +900,264 @@ grub_err_t ventoy_cmd_wimdows_locate_wim(grub_extcmd_context_t ctxt, int argc, c
     }
     else
     {
-        debug("failed to find lookup entry for replace file 0x%02x 0x%02x\n", g_old_hash.sha1[0], g_old_hash.sha1[1]);
+        debug("failed to find lookup entry for replace file 0x%02x 0x%02x\n", 
+               patch->old_hash.sha1[0],  patch->old_hash.sha1[1]);
     }
 
-    g_wim_data.wim_raw_size = (grub_uint32_t)file->size;
-    g_wim_data.wim_align_size = ventoy_align(g_wim_data.wim_raw_size, 2048);
+    wim_data->wim_raw_size = (grub_uint32_t)file->size;
+    wim_data->wim_align_size = ventoy_align(wim_data->wim_raw_size, 2048);
     
-    check_free(g_wim_data.new_meta_data, grub_free);
-    g_wim_data.new_meta_data = decompress_data;
-    g_wim_data.new_meta_len = head->metadata.raw_size;
-    g_wim_data.new_meta_align_len = ventoy_align(g_wim_data.new_meta_len, 2048);
+    grub_check_free(wim_data->new_meta_data);
+    wim_data->new_meta_data = decompress_data;
+    wim_data->new_meta_len = head->metadata.raw_size;
+    wim_data->new_meta_align_len = ventoy_align(wim_data->new_meta_len, 2048);
     
-    check_free(g_wim_data.new_lookup_data, grub_free);
-    g_wim_data.new_lookup_data = (grub_uint8_t *)lookup;
-    g_wim_data.new_lookup_len = (grub_uint32_t)head->lookup.raw_size;
-    g_wim_data.new_lookup_align_len = ventoy_align(g_wim_data.new_lookup_len, 2048);
+    grub_check_free(wim_data->new_lookup_data);
+    wim_data->new_lookup_data = (grub_uint8_t *)lookup;
+    wim_data->new_lookup_len = (grub_uint32_t)head->lookup.raw_size;
+    wim_data->new_lookup_align_len = ventoy_align(wim_data->new_lookup_len, 2048);
 
     head->metadata.flags = RESHDR_FLAG_METADATA;
-    head->metadata.offset = g_wim_data.wim_align_size + g_wim_data.bin_align_len;
-    head->metadata.size_in_wim = g_wim_data.new_meta_len;
-    head->metadata.raw_size = g_wim_data.new_meta_len;
+    head->metadata.offset = wim_data->wim_align_size + wim_data->bin_align_len;
+    head->metadata.size_in_wim = wim_data->new_meta_len;
+    head->metadata.raw_size = wim_data->new_meta_len;
 
     head->lookup.flags = 0;
-    head->lookup.offset = head->metadata.offset + g_wim_data.new_meta_align_len;
-    head->lookup.size_in_wim = g_wim_data.new_lookup_len;
-    head->lookup.raw_size = g_wim_data.new_lookup_len;
+    head->lookup.offset = head->metadata.offset + wim_data->new_meta_align_len;
+    head->lookup.size_in_wim = wim_data->new_lookup_len;
+    head->lookup.raw_size = wim_data->new_lookup_len;
 
     grub_file_close(file);
 
     debug("%s", "windows locate wim finish\n");
-    VENTOY_CMD_RETURN(GRUB_ERR_NONE);
+    return 0;
+}
+
+grub_err_t ventoy_cmd_locate_wim_patch(grub_extcmd_context_t ctxt, int argc, char **args)
+{
+    wim_patch *node = g_wim_patch_head;
+
+    (void)ctxt;
+    (void)argc;
+    (void)args;
+
+    while (node)
+    {
+        if (0 == ventoy_wimdows_locate_wim(args[0], node))
+        {
+            node->valid = 1;
+            g_wim_valid_patch_count++;
+        }
+
+        node = node->next;
+    }
+
+    return 0;
 }
 
 static grub_uint32_t ventoy_get_override_chunk_num(void)
 {
-    /* 1: block count in Partition Descriptor */
-    /* 2: file_size in file_entry or extend_file_entry */
-    /* 3: data_size and position in extend data short ad */
-    /* 4: new wim file header */
-    return 4;
+    grub_uint32_t chunk_num = 0;
+    
+    if (g_iso_fs_type == 0)
+    {
+        /* ISO9660: */
+        /* per wim */
+        /* 1: file_size and file_offset */
+        /* 2: new wim file header */
+        chunk_num = g_wim_valid_patch_count * 2;
+    }
+    else
+    {
+        /* UDF: */
+        /* global: */
+        /* 1: block count in Partition Descriptor */
+
+        /* per wim */
+        /* 1: file_size in file_entry or extend_file_entry */
+        /* 2: data_size and position in extend data short ad */
+        /* 3: new wim file header */
+        chunk_num = g_wim_valid_patch_count * 3 + 1;
+    }
+
+    if (g_suppress_wincd_override_offset > 0)
+    {
+        chunk_num++;
+    }
+
+    return chunk_num;
 }
 
-static void ventoy_windows_fill_override_data(    grub_uint64_t isosize, void *override)
+static void ventoy_fill_suppress_wincd_override_data(void *override)
 {
-    grub_uint32_t data32;
-    grub_uint64_t data64;
+    ventoy_override_chunk *cur = (ventoy_override_chunk *)override;
+
+    cur->override_size = 4;
+    cur->img_offset = g_suppress_wincd_override_offset;
+    grub_memcpy(cur->override_data, &g_suppress_wincd_override_data, cur->override_size);
+}
+
+static void ventoy_windows_fill_override_data_iso9660(    grub_uint64_t isosize, void *override)
+{
     grub_uint64_t sector;
     grub_uint32_t new_wim_size;
     ventoy_override_chunk *cur;
+    wim_patch *node = NULL;
+    wim_tail *wim_data = NULL;
+    ventoy_iso9660_override *dirent = NULL;
 
     sector = (isosize + 2047) / 2048;
 
     cur = (ventoy_override_chunk *)override;
 
-    new_wim_size = g_wim_data.wim_align_size + g_wim_data.bin_align_len + 
-        g_wim_data.new_meta_align_len + g_wim_data.new_lookup_align_len;
-
-    if (g_wim_data.iso_type == 0)
+    if (g_suppress_wincd_override_offset > 0)
     {
-        ventoy_iso9660_override *dirent = (ventoy_iso9660_override *)g_wim_data.override_data;
+        ventoy_fill_suppress_wincd_override_data(cur);
+        cur++;
+    }
+
+    debug("ventoy_windows_fill_override_data_iso9660 %lu\n", (ulong)isosize);
+
+    for (node = g_wim_patch_head; node; node = node->next)
+    {
+        wim_data = &node->wim_data;
+        if (0 == node->valid)
+        {
+            continue;
+        }
+        
+        new_wim_size = wim_data->wim_align_size + wim_data->bin_align_len + 
+                wim_data->new_meta_align_len + wim_data->new_lookup_align_len;
+
+        dirent = (ventoy_iso9660_override *)wim_data->override_data;
 
         dirent->first_sector    = (grub_uint32_t)sector;
         dirent->size            = new_wim_size;
         dirent->first_sector_be = grub_swap_bytes32(dirent->first_sector);
         dirent->size_be         = grub_swap_bytes32(dirent->size);
+
+        sector += (new_wim_size / 2048);
+
+        /* override 1: position and length in dirent */
+        cur->img_offset = wim_data->override_offset;
+        cur->override_size = wim_data->override_len;
+        grub_memcpy(cur->override_data, wim_data->override_data, cur->override_size);
+        cur++;
+
+        /* override 2: new wim file header */
+        cur->img_offset = wim_data->file_offset;
+        cur->override_size = sizeof(wim_header);
+        grub_memcpy(cur->override_data, &(wim_data->wim_header), cur->override_size);
+        cur++;
     }
-    else
+
+    return;
+}
+
+static void ventoy_windows_fill_override_data_udf(    grub_uint64_t isosize, void *override)
+{
+    grub_uint32_t data32;
+    grub_uint64_t data64;
+    grub_uint64_t sector;
+    grub_uint32_t new_wim_size;
+    grub_uint64_t total_wim_size = 0;
+    grub_uint32_t udf_start_block = 0;
+    ventoy_override_chunk *cur;
+    wim_patch *node = NULL;
+    wim_tail *wim_data = NULL;
+    ventoy_udf_override *udf = NULL;
+
+    sector = (isosize + 2047) / 2048;
+
+    cur = (ventoy_override_chunk *)override;
+    
+    if (g_suppress_wincd_override_offset > 0)
     {
-        ventoy_udf_override *udf = (ventoy_udf_override *)g_wim_data.override_data;
-        udf->length   = new_wim_size;
-        udf->position = (grub_uint32_t)sector - g_wim_data.udf_start_block;
+        ventoy_fill_suppress_wincd_override_data(cur);
+        cur++;
+    }
+
+    debug("ventoy_windows_fill_override_data_udf %lu\n", (ulong)isosize);
+
+    for (node = g_wim_patch_head; node; node = node->next)
+    {
+        wim_data = &node->wim_data;
+        if (node->valid)
+        {
+            if (udf_start_block == 0)
+            {
+                udf_start_block = wim_data->udf_start_block;
+            }
+            new_wim_size = wim_data->wim_align_size + wim_data->bin_align_len + 
+                wim_data->new_meta_align_len + wim_data->new_lookup_align_len;
+            total_wim_size += new_wim_size;
+        }
     }
 
     //override 1: sector number in pd data 
     cur->img_offset = grub_udf_get_last_pd_size_offset();
     cur->override_size = 4;
-    data32 = sector - g_wim_data.udf_start_block + (new_wim_size / 2048);
+    data32 = sector - udf_start_block + (total_wim_size / 2048);
     grub_memcpy(cur->override_data, &(data32), 4);
 
-    //override 2: filesize in file_entry
-    cur++;
-    cur->img_offset = g_wim_data.fe_entry_size_offset;
-    cur->override_size = 8;
-    data64 = new_wim_size;
-    grub_memcpy(cur->override_data, &(data64), 8);
+    for (node = g_wim_patch_head; node; node = node->next)
+    {
+        wim_data = &node->wim_data;
+        if (0 == node->valid)
+        {
+            continue;
+        }
+        
+        new_wim_size = wim_data->wim_align_size + wim_data->bin_align_len + 
+                wim_data->new_meta_align_len + wim_data->new_lookup_align_len;
 
-    /* override 3: position and length in extend data */
-    cur++;
-    cur->img_offset = g_wim_data.override_offset;
-    cur->override_size = g_wim_data.override_len;
-    grub_memcpy(cur->override_data, g_wim_data.override_data, cur->override_size);
+        //override 2: filesize in file_entry
+        cur++;
+        cur->img_offset = wim_data->fe_entry_size_offset;
+        cur->override_size = 8;
+        data64 = new_wim_size;
+        grub_memcpy(cur->override_data, &(data64), 8);
 
-    /* override 4: new wim file header */
-    cur++;
-    cur->img_offset = g_wim_data.file_offset;
-    cur->override_size = sizeof(wim_header);
-    grub_memcpy(cur->override_data, &(g_wim_data.wim_header), cur->override_size);
+        udf = (ventoy_udf_override *)wim_data->override_data;
+        udf->length   = new_wim_size;
+        udf->position = (grub_uint32_t)sector - udf_start_block;
+
+        sector += (new_wim_size / 2048);
+
+        /* override 3: position and length in extend data */
+        cur++;
+        cur->img_offset = wim_data->override_offset;
+        cur->override_size = wim_data->override_len;
+        grub_memcpy(cur->override_data, wim_data->override_data, cur->override_size);
+
+        /* override 4: new wim file header */
+        cur++;
+        cur->img_offset = wim_data->file_offset;
+        cur->override_size = sizeof(wim_header);
+        grub_memcpy(cur->override_data, &(wim_data->wim_header), cur->override_size);
+    }
 
     return;
+}
+
+static grub_uint32_t ventoy_windows_get_virt_data_size(void)
+{
+    grub_uint32_t size = 0;
+    wim_tail *wim_data = NULL;
+    wim_patch *node = g_wim_patch_head;
+    
+    while (node)
+    {
+        if (node->valid)
+        {
+            wim_data = &node->wim_data;
+            size += sizeof(ventoy_virt_chunk) + wim_data->bin_align_len + 
+                    wim_data->new_meta_align_len + wim_data->new_lookup_align_len;
+        }
+        node = node->next;
+    }
+    
+    return size;
 }
 
 static void ventoy_windows_fill_virt_data(    grub_uint64_t isosize, ventoy_chain_head *chain)
@@ -732,37 +1168,53 @@ static void ventoy_windows_fill_virt_data(    grub_uint64_t isosize, ventoy_chai
     grub_uint32_t mem_secs;
     char *override = NULL;
     ventoy_virt_chunk *cur = NULL;
+    wim_tail *wim_data = NULL;
+    wim_patch *node = NULL;    
 
     sector = (isosize + 2047) / 2048;
-    offset = sizeof(ventoy_virt_chunk);
-    
-    wim_secs = g_wim_data.wim_align_size / 2048;
-    mem_secs = (g_wim_data.bin_align_len + g_wim_data.new_meta_align_len + g_wim_data.new_lookup_align_len) / 2048;
+    offset = sizeof(ventoy_virt_chunk) * g_wim_valid_patch_count;
 
     override = (char *)chain + chain->virt_chunk_offset;
     cur = (ventoy_virt_chunk *)override;
 
-    cur->remap_sector_start = sector;
-    cur->remap_sector_end   = cur->remap_sector_start + wim_secs;
-    cur->org_sector_start   = (grub_uint32_t)(g_wim_data.file_offset / 2048);
-    
-    cur->mem_sector_start   = cur->remap_sector_end;
-    cur->mem_sector_end     = cur->mem_sector_start + mem_secs;
-    cur->mem_sector_offset  = offset;
+    for (node = g_wim_patch_head; node; node = node->next)
+    {
+        if (0 == node->valid)
+        {
+            continue;
+        }
 
-    grub_memcpy(override + offset, g_wim_data.jump_bin_data, g_wim_data.bin_raw_len);
-    offset += g_wim_data.bin_align_len;
+        wim_data = &node->wim_data;
 
-    grub_memcpy(override + offset, g_wim_data.new_meta_data, g_wim_data.new_meta_len);
-    offset += g_wim_data.new_meta_align_len;
-    
-    grub_memcpy(override + offset, g_wim_data.new_lookup_data, g_wim_data.new_lookup_len);
-    offset += g_wim_data.new_lookup_align_len;
+        wim_secs = wim_data->wim_align_size / 2048;
+        mem_secs = (wim_data->bin_align_len + wim_data->new_meta_align_len + wim_data->new_lookup_align_len) / 2048;
 
-    chain->virt_img_size_in_bytes += g_wim_data.wim_align_size + 
-                                     g_wim_data.bin_align_len + 
-                                     g_wim_data.new_meta_align_len + 
-                                     g_wim_data.new_lookup_align_len;
+        cur->remap_sector_start = sector;
+        cur->remap_sector_end   = cur->remap_sector_start + wim_secs;
+        cur->org_sector_start   = (grub_uint32_t)(wim_data->file_offset / 2048);
+        
+        cur->mem_sector_start   = cur->remap_sector_end;
+        cur->mem_sector_end     = cur->mem_sector_start + mem_secs;
+        cur->mem_sector_offset  = offset;
+
+        sector += wim_secs + mem_secs;
+        cur++;
+
+        grub_memcpy(override + offset, wim_data->jump_bin_data, wim_data->bin_raw_len);
+        offset += wim_data->bin_align_len;
+
+        grub_memcpy(override + offset, wim_data->new_meta_data, wim_data->new_meta_len);
+        offset += wim_data->new_meta_align_len;
+        
+        grub_memcpy(override + offset, wim_data->new_lookup_data, wim_data->new_lookup_len);
+        offset += wim_data->new_lookup_align_len;
+
+        chain->virt_img_size_in_bytes += wim_data->wim_align_size + 
+                                         wim_data->bin_align_len + 
+                                         wim_data->new_meta_align_len + 
+                                         wim_data->new_lookup_align_len;
+    }
+
     return;
 }
 
@@ -792,6 +1244,61 @@ static int ventoy_windows_drive_map(ventoy_chain_head *chain)
     }
 
     return 0;
+}
+
+static int ventoy_suppress_windows_cd_prompt(void)
+{
+    int rc = 1;
+    const char  *cdprompt = NULL;
+    grub_uint64_t readpos = 0;
+    grub_file_t file = NULL;
+    grub_uint8_t data[32];
+
+    cdprompt = ventoy_get_env("VTOY_WINDOWS_CD_PROMPT");
+    if (cdprompt && cdprompt[0] == '1' && cdprompt[1] == 0)
+    {
+        debug("VTOY_WINDOWS_CD_PROMPT:<%s>\n", cdprompt);
+        return 0;
+    }
+
+    g_ventoy_case_insensitive = 1;
+    file = ventoy_grub_file_open(VENTOY_FILE_TYPE, "%s/boot/bootfix.bin", "(loop)");
+    g_ventoy_case_insensitive = 0;
+
+    if (!file)
+    {
+        debug("Failed to open %s\n", "bootfix.bin");
+        goto end;
+    }
+
+    grub_file_read(file, data, 32);
+
+    if (file->fs && file->fs->name && grub_strcmp(file->fs->name, "udf") == 0)
+    {
+        readpos = grub_udf_get_file_offset(file);
+    }
+    else
+    {
+        readpos = grub_iso9660_get_last_read_pos(file);
+    }
+
+    debug("bootfix.bin readpos:%lu (sector:%lu)  data: %02x %02x %02x %02x\n", 
+        (ulong)readpos, (ulong)readpos / 2048, data[24], data[25], data[26], data[27]);
+
+    if (*(grub_uint32_t *)(data + 24) == 0x13cd0080)
+    {
+        g_suppress_wincd_override_offset = readpos + 24;
+        g_suppress_wincd_override_data = 0x13cd00fd;
+
+        rc = 0;
+    }
+
+    debug("g_suppress_wincd_override_offset:%lu\n", (ulong)g_suppress_wincd_override_offset);
+
+end:
+    check_free(file, grub_file_close);
+
+    return rc;
 }
 
 grub_err_t ventoy_cmd_windows_chain_data(grub_extcmd_context_t ctxt, int argc, char **args)
@@ -828,7 +1335,7 @@ grub_err_t ventoy_cmd_windows_chain_data(grub_extcmd_context_t ctxt, int argc, c
         return 1;
     }
 
-    if (0 == ventoy_compatible && g_wim_data.new_meta_data == NULL)
+    if (0 == ventoy_compatible && g_wim_valid_patch_count == 0)
     {
         unknown_image = 1;
         debug("Warning: %s was not recognized by Ventoy\n", args[0]);
@@ -862,17 +1369,23 @@ grub_err_t ventoy_cmd_windows_chain_data(grub_extcmd_context_t ctxt, int argc, c
         }
     }
 
+    g_suppress_wincd_override_offset = 0;
+    if (!ventoy_is_efi_os()) /* legacy mode */
+    {
+        ventoy_suppress_windows_cd_prompt();
+    }
+
     img_chunk_size = g_img_chunk_list.cur_chunk * sizeof(ventoy_img_chunk);
     
     if (ventoy_compatible || unknown_image)
     {
-        size = sizeof(ventoy_chain_head) + img_chunk_size;
+        override_size = g_suppress_wincd_override_offset > 0 ? sizeof(ventoy_override_chunk) : 0;
+        size = sizeof(ventoy_chain_head) + img_chunk_size + override_size;
     }
     else
     {
         override_size = ventoy_get_override_chunk_num() * sizeof(ventoy_override_chunk);
-        virt_chunk_size = sizeof(ventoy_virt_chunk) + g_wim_data.bin_align_len + 
-            g_wim_data.new_meta_align_len + g_wim_data.new_lookup_align_len;;
+        virt_chunk_size = ventoy_windows_get_virt_data_size();
         size = sizeof(ventoy_chain_head) + img_chunk_size + override_size + virt_chunk_size;
     }
 
@@ -903,9 +1416,10 @@ grub_err_t ventoy_cmd_windows_chain_data(grub_extcmd_context_t ctxt, int argc, c
     grub_memset(chain, 0, sizeof(ventoy_chain_head));
 
     /* part 1: os parameter */
+    g_ventoy_chain_type = ventoy_chain_windows;
     ventoy_fill_os_param(file, &(chain->os_param));
 
-    if (g_wim_data.jump_bin_data && g_wim_data.new_meta_data)
+    if (0 == unknown_image)
     {
         ventoy_update_before_chain(&(chain->os_param), args[0]);
     }
@@ -931,10 +1445,17 @@ grub_err_t ventoy_cmd_windows_chain_data(grub_extcmd_context_t ctxt, int argc, c
 
     if (ventoy_compatible || unknown_image)
     {
+        if (g_suppress_wincd_override_offset > 0)
+        {
+            chain->override_chunk_offset = chain->img_chunk_offset + img_chunk_size;
+            chain->override_chunk_num = 1;
+            ventoy_fill_suppress_wincd_override_data((char *)chain + chain->override_chunk_offset);
+        }
+
         return 0;
     }
 
-    if (g_wim_data.new_meta_data == NULL)
+    if (0 == g_wim_valid_patch_count)
     {
         return 0;
     }
@@ -942,17 +1463,237 @@ grub_err_t ventoy_cmd_windows_chain_data(grub_extcmd_context_t ctxt, int argc, c
     /* part 4: override chunk */
     chain->override_chunk_offset = chain->img_chunk_offset + img_chunk_size;
     chain->override_chunk_num = ventoy_get_override_chunk_num();
-    ventoy_windows_fill_override_data(isosize, (char *)chain + chain->override_chunk_offset);
+
+    if (g_iso_fs_type == 0)
+    {
+        ventoy_windows_fill_override_data_iso9660(isosize, (char *)chain + chain->override_chunk_offset);
+    }
+    else
+    {
+        ventoy_windows_fill_override_data_udf(isosize, (char *)chain + chain->override_chunk_offset);        
+    }
 
     /* part 5: virt chunk */
     chain->virt_chunk_offset = chain->override_chunk_offset + override_size;
-    chain->virt_chunk_num = 1;
+    chain->virt_chunk_num = g_wim_valid_patch_count;
     ventoy_windows_fill_virt_data(isosize, chain);
 
     if (ventoy_is_efi_os() == 0)
     {
         ventoy_windows_drive_map(chain);        
     }
+
+    VENTOY_CMD_RETURN(GRUB_ERR_NONE);
+}
+
+static grub_uint32_t ventoy_get_wim_iso_offset(const char *filepath)
+{
+    grub_uint32_t imgoffset;
+    grub_file_t file;
+    char cmdbuf[128];
+    
+    grub_snprintf(cmdbuf, sizeof(cmdbuf), "loopback wimiso %s", filepath);
+    grub_script_execute_sourcecode(cmdbuf);
+
+    file = ventoy_grub_file_open(VENTOY_FILE_TYPE, "%s", "(wimiso)/boot/boot.wim");
+    if (!file)
+    {
+        grub_printf("Failed to open boot.wim file in the image file\n");
+        return 0;
+    }
+
+    imgoffset = (grub_uint32_t)grub_iso9660_get_last_file_dirent_pos(file) + 2;
+
+    debug("wimiso wim direct offset: %u\n", imgoffset);
+    
+    grub_file_close(file);
+    
+    grub_script_execute_sourcecode("loopback -d wimiso");
+
+    return imgoffset;
+}
+
+static int ventoy_get_wim_chunklist(const char *filename, ventoy_img_chunk_list *wimchunk, grub_uint64_t *wimsize)
+{
+    grub_file_t wimfile;
+    
+    wimfile = ventoy_grub_file_open(VENTOY_FILE_TYPE, "%s", filename);
+    if (!wimfile)
+    {
+        return 1;
+    }
+
+    grub_memset(wimchunk, 0, sizeof(ventoy_img_chunk_list));
+    wimchunk->chunk = grub_malloc(sizeof(ventoy_img_chunk) * DEFAULT_CHUNK_NUM);
+    if (NULL == wimchunk->chunk)
+    {
+        grub_file_close(wimfile);
+        return grub_error(GRUB_ERR_OUT_OF_MEMORY, "Can't allocate image chunk memoty\n");
+    }
+    
+    wimchunk->max_chunk = DEFAULT_CHUNK_NUM;
+    wimchunk->cur_chunk = 0;
+    
+    ventoy_get_block_list(wimfile, wimchunk, wimfile->device->disk->partition->start);
+
+    *wimsize = wimfile->size;
+    grub_file_close(wimfile);
+
+    return 0;
+}
+
+grub_err_t ventoy_cmd_wim_chain_data(grub_extcmd_context_t ctxt, int argc, char **args)
+{
+    grub_uint32_t i = 0;
+    grub_uint32_t imgoffset = 0;
+    grub_uint32_t size = 0;
+    grub_uint32_t isosector = 0;
+    grub_uint64_t wimsize = 0;
+    grub_uint32_t boot_catlog = 0;
+    grub_uint32_t img_chunk1_size = 0;
+    grub_uint32_t img_chunk2_size = 0;
+    grub_uint32_t override_size = 0;
+    grub_file_t file;
+    grub_disk_t disk;
+    const char *pLastChain = NULL;
+    ventoy_chain_head *chain;
+    ventoy_iso9660_override *dirent;
+    ventoy_img_chunk *chunknode;
+    ventoy_override_chunk *override;
+    ventoy_img_chunk_list wimchunk;
+    char envbuf[128];
+    
+    (void)ctxt;
+    (void)argc;
+
+    debug("wim chain data begin <%s> ...\n", args[0]);
+
+    if (NULL == g_wimiso_chunk_list.chunk || NULL == g_wimiso_path)
+    {
+        grub_printf("ventoy not ready\n");
+        return 1;
+    }
+
+    imgoffset = ventoy_get_wim_iso_offset(g_wimiso_path);
+    if (imgoffset == 0)
+    {
+        grub_printf("image offset not found\n");
+        return 1;
+    }
+
+    if (0 != ventoy_get_wim_chunklist(args[0], &wimchunk, &wimsize))
+    {
+        grub_printf("Failed to get wim chunklist\n");
+        return 1;
+    }
+
+    file = ventoy_grub_file_open(VENTOY_FILE_TYPE, "%s", g_wimiso_path);
+    if (!file)
+    {
+        return 1;
+    }
+
+    boot_catlog = ventoy_get_iso_boot_catlog(file);
+
+    img_chunk1_size = g_wimiso_chunk_list.cur_chunk * sizeof(ventoy_img_chunk);
+    img_chunk2_size = wimchunk.cur_chunk * sizeof(ventoy_img_chunk);
+    override_size = sizeof(ventoy_override_chunk);
+    
+    size = sizeof(ventoy_chain_head) + img_chunk1_size + img_chunk2_size + override_size;
+
+    pLastChain = grub_env_get("vtoy_chain_mem_addr");
+    if (pLastChain)
+    {
+        chain = (ventoy_chain_head *)grub_strtoul(pLastChain, NULL, 16);
+        if (chain)
+        {
+            debug("free last chain memory %p\n", chain);
+            grub_free(chain);
+        }
+    }
+
+    chain = grub_malloc(size);
+    if (!chain)
+    {
+        grub_printf("Failed to alloc chain memory size %u\n", size);
+        grub_file_close(file);
+        return 1;
+    }
+
+    grub_snprintf(envbuf, sizeof(envbuf), "0x%lx", (unsigned long)chain);
+    grub_env_set("vtoy_chain_mem_addr", envbuf);
+    grub_snprintf(envbuf, sizeof(envbuf), "%u", size);
+    grub_env_set("vtoy_chain_mem_size", envbuf);
+
+    grub_memset(chain, 0, sizeof(ventoy_chain_head));
+
+    /* part 1: os parameter */
+    g_ventoy_chain_type = ventoy_chain_wim;
+    ventoy_fill_os_param(file, &(chain->os_param));
+
+    /* part 2: chain head */
+    disk = file->device->disk;
+    chain->disk_drive = disk->id;
+    chain->disk_sector_size = (1 << disk->log_sector_size);
+    chain->real_img_size_in_bytes = ventoy_align_2k(file->size) + ventoy_align_2k(wimsize);
+    chain->virt_img_size_in_bytes = chain->real_img_size_in_bytes;
+    chain->boot_catalog = boot_catlog;
+
+    if (!ventoy_is_efi_os())
+    {
+        grub_file_seek(file, boot_catlog * 2048);
+        grub_file_read(file, chain->boot_catalog_sector, sizeof(chain->boot_catalog_sector));
+    }
+
+    /* part 3: image chunk */
+    chain->img_chunk_offset = sizeof(ventoy_chain_head);
+    chain->img_chunk_num = g_wimiso_chunk_list.cur_chunk + wimchunk.cur_chunk;
+    grub_memcpy((char *)chain + chain->img_chunk_offset, g_wimiso_chunk_list.chunk, img_chunk1_size);
+
+    /* fs cluster size >= 2048, so don't need to proc align */
+
+    /* align by 2048 */
+    chunknode = wimchunk.chunk + wimchunk.cur_chunk - 1;
+    i = (chunknode->disk_end_sector + 1 - chunknode->disk_start_sector) % 4;
+    if (i)
+    {
+        chunknode->disk_end_sector += 4 - i;
+    }
+
+    isosector = (grub_uint32_t)((file->size + 2047) / 2048);
+    for (i = 0; i < wimchunk.cur_chunk; i++)
+    {
+        chunknode = wimchunk.chunk + i;
+        chunknode->img_start_sector = isosector;
+        chunknode->img_end_sector = chunknode->img_start_sector + 
+            ((chunknode->disk_end_sector + 1 - chunknode->disk_start_sector) / 4) - 1;
+        isosector = chunknode->img_end_sector + 1;
+    }
+    
+    grub_memcpy((char *)chain + chain->img_chunk_offset + img_chunk1_size, wimchunk.chunk, img_chunk2_size);
+
+    /* part 4: override chunk */
+    chain->override_chunk_offset = chain->img_chunk_offset + img_chunk1_size + img_chunk2_size;
+    chain->override_chunk_num = 1;
+
+    override = (ventoy_override_chunk *)((char *)chain + chain->override_chunk_offset);
+    override->img_offset = imgoffset;
+    override->override_size = sizeof(ventoy_iso9660_override);
+    
+    dirent = (ventoy_iso9660_override *)(override->override_data);
+    dirent->first_sector    = (grub_uint32_t)((file->size + 2047) / 2048);
+    dirent->size            = (grub_uint32_t)(wimsize);
+    dirent->first_sector_be = grub_swap_bytes32(dirent->first_sector);
+    dirent->size_be         = grub_swap_bytes32(dirent->size);
+
+    debug("imgoffset=%u first_sector=0x%x size=0x%x\n", imgoffset, dirent->first_sector, dirent->size);
+
+    if (ventoy_is_efi_os() == 0)
+    {
+        ventoy_windows_drive_map(chain);        
+    }
+
+    grub_file_close(file);
 
     VENTOY_CMD_RETURN(GRUB_ERR_NONE);
 }

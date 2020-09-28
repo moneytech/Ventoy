@@ -1,5 +1,8 @@
 #!/bin/sh
 
+dos2unix -q ./tool/ventoy_lib.sh
+dos2unix -q ./tool/VentoyWorker.sh
+
 . ./tool/ventoy_lib.sh
 
 GRUB_DIR=../GRUB2/INSTALL
@@ -13,6 +16,7 @@ fi
 
 cd ../IMG
 sh mkcpio.sh
+sh mkloopex.sh
 cd -
 
 
@@ -28,7 +32,7 @@ while ! grep -q 524288 /sys/block/${LOOP#/dev/}/size 2>/dev/null; do
     sleep 1
 done
 
-format_ventoy_disk $LOOP 
+format_ventoy_disk_mbr 0 $LOOP fdisk
 
 $GRUB_DIR/sbin/grub-bios-setup  --skip-fs-probe  --directory="./grub/i386-pc"  $LOOP
 
@@ -59,7 +63,7 @@ cp -a ./tool/ENROLL_THIS_KEY_IN_MOKMANAGER.cer $tmpmnt/
 mkdir -p $tmpmnt/tool
 cp -a ./tool/mount*     $tmpmnt/tool/
 
-rm -f $tmpmnt/grub/i386-pc/*
+rm -f $tmpmnt/grub/i386-pc/*.img
 
 
 umount $tmpmnt && rm -rf $tmpmnt
@@ -74,8 +78,13 @@ dd if=$LOOP of=$tmpdir/boot/core.img bs=512 count=2047 skip=1 status=none
 xz --check=crc32 $tmpdir/boot/core.img
 
 cp -a ./tool $tmpdir/
+rm -f $tmpdir/ENROLL_THIS_KEY_IN_MOKMANAGER.cer
 cp -a Ventoy2Disk.sh $tmpdir/
-
+cp -a README $tmpdir/
+cp -a plugin $tmpdir/
+cp -a CreatePersistentImg.sh $tmpdir/
+dos2unix -q $tmpdir/Ventoy2Disk.sh
+dos2unix -q $tmpdir/CreatePersistentImg.sh
 
 #32MB disk img
 dd status=none if=$LOOP of=$tmpdir/ventoy/ventoy.disk.img bs=512 count=$VENTOY_SECTOR_NUM skip=$part2_start_sector
@@ -95,19 +104,34 @@ for file in $(ls); do
     fi
 done
 
+#chmod 
 cd $CurDir
+find $tmpdir/ -type d -exec chmod 755 "{}" +
+find $tmpdir/ -type f -exec chmod 644 "{}" +
+chmod +x $tmpdir/Ventoy2Disk.sh
+chmod +x $tmpdir/CreatePersistentImg.sh
+
 tar -czvf ventoy-${curver}-linux.tar.gz $tmpdir
 
+
+
 rm -f ventoy-${curver}-windows.zip
-cp -a Ventoy2Disk.exe $tmpdir/
+cp -a Ventoy2Disk*.exe $tmpdir/
 cp -a $LANG_DIR/languages.ini $tmpdir/ventoy/
 rm -rf $tmpdir/tool
 rm -f $tmpdir/*.sh
+rm -f $tmpdir/README
 
 
 zip -r ventoy-${curver}-windows.zip $tmpdir/
 
 rm -rf $tmpdir
+
+cd ../LiveCD
+sh livecd.sh
+cd $CurDir
+
+mv ../LiveCD/ventoy*.iso ./
 
 if [ -e ventoy-${curver}-windows.zip ] && [ -e ventoy-${curver}-linux.tar.gz ]; then
     echo -e "\n ============= SUCCESS =================\n"
@@ -116,4 +140,5 @@ else
     exit 1
 fi
 
+rm -f log.txt
 
